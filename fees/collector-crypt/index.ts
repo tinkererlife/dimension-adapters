@@ -2,7 +2,7 @@ import { SimpleAdapter, FetchOptions, Dependencies } from "../../adapters/types"
 import { CHAIN } from "../../helpers/chains";
 import { queryAllium } from "../../helpers/allium";
 
-const GACHA_TIERS = [25, 50, 75, 80, 100, 250, 1000, 2500];
+const GACHA_TIERS = [25, 50, 75, 80, 100, 151, 250, 1000, 2500];
 
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 
@@ -92,6 +92,7 @@ const fetch = async (options: FetchOptions) => {
         SUM(CASE WHEN amount = 75 THEN amount ELSE 0 END) AS gacha_spend_75,
         SUM(CASE WHEN amount = 80 THEN amount ELSE 0 END) AS gacha_spend_80,
         SUM(CASE WHEN amount = 100 THEN amount ELSE 0 END) AS gacha_spend_100,
+        SUM(CASE WHEN amount = 151 THEN amount ELSE 0 END) AS gacha_spend_151,
         SUM(CASE WHEN amount = 250 THEN amount ELSE 0 END) AS gacha_spend_250,
         SUM(CASE WHEN amount = 1000 THEN amount ELSE 0 END) AS gacha_spend_1000,
         SUM(CASE WHEN amount = 2500 THEN amount ELSE 0 END) AS gacha_spend_2500
@@ -137,6 +138,7 @@ const fetch = async (options: FetchOptions) => {
       COALESCE(g.gacha_spend_75, 0) AS gacha_spend_75,
       COALESCE(g.gacha_spend_80, 0) AS gacha_spend_80,
       COALESCE(g.gacha_spend_100, 0) AS gacha_spend_100,
+      COALESCE(g.gacha_spend_151, 0) AS gacha_spend_151,
       COALESCE(g.gacha_spend_250, 0) AS gacha_spend_250,
       COALESCE(g.gacha_spend_1000, 0) AS gacha_spend_1000,
       COALESCE(g.gacha_spend_2500, 0) AS gacha_spend_2500,
@@ -209,6 +211,7 @@ const gachaBreakdown = {
   "Gacha $75 Pack Sales": "Gacha pack sales at $75.",
   "Gacha $80 Pack Sales": "Gacha pack sales at $80.",
   "Gacha $100 Pack Sales": "Gacha pack sales at $100.",
+  "Gacha $151 Pack Sales": "Rarible-exclusive Pokemon 151 gacha pack sales at $151.",
   "Gacha $250 Pack Sales": "Gacha pack sales at $250.",
   "Gacha $1000 Pack Sales": "Gacha pack sales at $1000.",
   "Gacha $2500 Pack Sales": "Gacha pack sales at $2500.",
