@@ -1,6 +1,6 @@
 const { execSync } = require('child_process')
 
-const ALLOWED_ROOTS = ['volumes', 'dexs', 'options', 'derivatives', 'incentives', 'fees', 'protocols', 'aggregators', 'aggregator-derivatives', 'bridge-aggregators', 'open-interest']
+const ALLOWED_ROOTS = ['volumes', 'dexs', 'options', 'derivatives', 'incentives', 'fees', 'protocols', 'aggregators', 'aggregator-derivatives', 'bridge-aggregators', 'open-interest', 'retention']
 
 // exposes protocol names as `"<module>":`
 const ALLOWED_FACTORIES = ['uniV2', 'uniV3', 'uniSubgraph', 'blockscout', 'hyperliquid', 'compoundV2', 'orderly', 'gmxV1', 'chainTxFees', 'curators', 'saddle', 'solLst', 'joeLiquidityBook',
@@ -22,6 +22,11 @@ const fileSet = new Set();
 
   if (ALLOWED_FACTORIES.includes(file)) {
     addedProtocolKeys(file).forEach(protocolName => fileSet.add(`fees@${protocolName}`))
+  }
+
+  if (file === 'helpers/retention.ts') {
+    fileSet.add('retention@collector-crypt')
+    fileSet.add('retention@courtyard')
   }
 })
 
