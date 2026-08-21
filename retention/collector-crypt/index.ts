@@ -1,7 +1,12 @@
 import { GACHA_ONCHAIN_ADDRESSES, TEAM_ADDRESSES } from "../../fees/collector-crypt";
 import { CHAIN } from "../../helpers/chains";
-import { queryDuneSql } from "../../helpers/dune";
-import { createRetentionAdapter, RetentionActivity, RetentionConfig, RetentionQueryOptions } from "../../helpers/retention";
+import {
+  createRetentionFetchAdapter,
+  defineRetentionManifest,
+  RetentionActivity,
+  RetentionActivityRange,
+  RetentionQueryContext,
+} from "../../helpers/retention";
 
 // Wallet and volume retention (W4/W12) for Collector Crypt on Solana.
 //
@@ -22,15 +27,18 @@ import { createRetentionAdapter, RetentionActivity, RetentionConfig, RetentionQu
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 type DuneActivityRow = { day: string; wallet: string; volume_usd: string | number };
 
-async function getActivity(options: RetentionQueryOptions, fromDay: string, toDayExclusive: string): Promise<RetentionActivity[]> {
+async function queryActivity(
+  context: RetentionQueryContext,
+  range: RetentionActivityRange,
+): Promise<RetentionActivity[]> {
   const sinks = GACHA_ONCHAIN_ADDRESSES.map((a) => `'${a}'`).join(", ");
   const excluded = TEAM_ADDRESSES.map((a) => `'${a}'`).join(", ");
-  const rows: DuneActivityRow[] = await queryDuneSql(options, `
+  const rows = await context.queryDuneSql<DuneActivityRow>(`
 SELECT cast(date_trunc('day', t.block_time) AS date) AS day,
        t.from_owner AS wallet,
        sum(t.amount_display) AS volume_usd
 FROM tokens_solana.transfers t
-WHERE t.block_date >= date '${fromDay}' AND t.block_date < date '${toDayExclusive}'
+WHERE t.block_date >= date '${range.fromDay}' AND t.block_date < date '${range.toDayExclusive}'
   AND t.token_mint_address = '${USDC_MINT}'
   AND t.to_owner IN (${sinks})
   AND t.from_owner IS NOT NULL
@@ -41,7 +49,7 @@ GROUP BY 1, 2
   return rows.map((row) => ({ day: String(row.day).slice(0, 10), wallet: row.wallet, volumeUsd: Number(row.volume_usd) }));
 }
 
-export const retentionConfig: RetentionConfig = {
+export const retentionManifest = defineRetentionManifest({
   project: "collector-crypt",
   chain: CHAIN.SOLANA,
   stateVersion: 1,
@@ -49,9 +57,9 @@ export const retentionConfig: RetentionConfig = {
   // The current sink went live on Sunday 2025-12-07; cohorts start with the next
   // full UTC week, backed by eleven months of predecessor history.
   firstCohortStart: "2025-12-08",
-  getActivity,
+  queryActivity,
   methodology:
     "Daily rolling weekly cohort retention for Collector Crypt on Solana. Each daily row ends a complete seven-day return window; W4 and W12 compare it with the same seven-day window shifted 4 or 12 weeks earlier. The cohort contains wallets whose first observed USDC pack purchase into one of the on-chain gacha sinks occurred in that earlier window, with team and treasury wallets excluded. Purchases paid by card settle off-chain in bundled top-ups without a per-buyer identity and are not counted. Activity is observed from 2025-01-01 across both the current sink and its predecessor, so buyers who migrated to the 2025-12-07 sink are not counted as new; cohorts start on 2025-12-08.",
-};
+});
 
-export default createRetentionAdapter(retentionConfig);
+export default createRetentionFetchAdapter(retentionManifest);

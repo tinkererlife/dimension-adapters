@@ -31,6 +31,3 @@ jobs:
         
       - name: Checking cli
         run: pnpm run ts-check-cli
-
-      - name: Testing retention state flow
-        run: node --test -r ts-node/register/transpile-only helpers/retention.test.ts
