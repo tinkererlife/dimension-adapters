@@ -81,13 +81,10 @@ async function fetchRetentionMetrics(
     throw new Error("RETENTION_API_URL is required to fetch retention metrics");
   }
 
-  const url = [
-    baseUrl,
-    "v1/retention",
-    encodeURIComponent(manifest.project),
-    `v${manifest.stateVersion}`,
-    options.dateString,
-  ].join("/");
+  const url = new URL(
+    `${baseUrl}/v1/retention/${encodeURIComponent(manifest.project)}/${options.dateString}`,
+  );
+  url.searchParams.set("stateVersion", String(manifest.stateVersion));
   const response = await fetch(url);
   const body = await response.text();
   if (!response.ok) {
