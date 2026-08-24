@@ -4,121 +4,247 @@ import {
   defineRetentionManifest,
   RetentionActivity,
   RetentionActivityRange,
+  RetentionEvmLog,
   RetentionQueryContext,
 } from "../../helpers/retention";
 
 // Wallet and volume retention (W4/W12) for Courtyard on Polygon.
 //
-// Marketplace and minter membership comes from the same on-chain role registry
-// fees/courtyard uses. The Dune query reconstructs membership intervals from
-// RoleGranted/RoleRevoked logs, so backfills stay event-only while respecting
-// the registry state that was active for each purchase.
-// https://polygonscan.com/address/0x251be3a17af4892035c37ebf5890f4a4d889dcad#code
+// Runtime indexing uses only event logs. Courtyard's AccessControl registry emits
+// every contract-membership change as RoleGranted/RoleRevoked, and the purchase
+// contracts emit the buyer, payment token and amount. No eth_call or Dune query is
+// needed.
+// https://polygonscan.com/address/0x251be3a17af4892035c37ebf5890f4a4d889dcad#events
 const REGISTRY = "0x251be3a17af4892035c37ebf5890f4a4d889dcad";
-// First relevant RoleGranted log on the registry; it predates observationStart.
-const REGISTRY_ROLE_START = "2023-07-23";
-// keccak256 of the named AccessControl roles and events.
+
+// keccak256 hashes of Courtyard's AccessControl role names and event signatures.
 const MINTER_ROLE = "0x9f2df0fed2c77648de5860a4cc508cd0818c85b8b8a1ab4ceeef8d981c8956a6";
 const TRUSTED_OPERATOR_ROLE = "0x41c4ce85041f61d74dbc163195f4901b81f46e99d2a521a7b7f6d3a09da4f8c1";
 const TRUSTED_FORWARDER_ROLE = "0xd3df22cd6a774f62b0ae21ffd602cc92e7f3390518eee8b33307fc70380da7d2";
 const ROLE_GRANTED = "0x2f8788117e7eff1d82e926ec794901d17c78024a50270940304540a733656f0d";
 const ROLE_REVOKED = "0xf6391f5c32d9c69d2a47ea670b442974b53935d1edc7fd64eb21e047a839171b";
 
-// Dune has no decoded tables for these contracts, so the logs are decoded by hand.
-// Both topic0 values are keccak256 of the signatures fees/courtyard decodes:
-//
-//   TradeExecuted(address indexed bidder, address indexed asker, uint256 indexed nftTokenId,
-//                 address erc20Token, uint256 amount, bytes tradeSignature, uint256 feeAccrued)
-//     buyer = topic1, erc20Token = data word 0, amount = data word 1
-//
-//   TokenPurchasedAndMinted(address indexed mintedToAddress, address mintedTokenAddress,
-//                 uint256 mintedTokenId, address paymentTokenAddress, uint256 paymentAmount)
-//     buyer = topic1, paymentTokenAddress = data word 2, paymentAmount = data word 3
+// TradeExecuted(address indexed bidder, address indexed asker, uint256 indexed nftTokenId,
+//               address erc20Token, uint256 amount, bytes tradeSignature, uint256 feeAccrued)
+// TokenPurchasedAndMinted(address indexed mintedToAddress, address mintedTokenAddress,
+//               uint256 mintedTokenId, address paymentTokenAddress, uint256 paymentAmount)
 const TRADE_EXECUTED = "0xa6ae807740439025f50884311ce0f96f5c3809a8f7170f9459dab1b14c9d8afd";
 const TOKEN_PURCHASED_AND_MINTED = "0x3ac06088fd2f047b705cf81c76a5be8b7d378860415de575a9974868ca188980";
 
-// Every purchase on both rails settles in USDC - checked over the full observed
-// history, no event carries another payment token. The filter is kept so a future
-// second currency shows up as missing volume rather than as 6-decimal nonsense.
+// Polygon native USDC. Purchase events using another token are deliberately ignored
+// because their raw amount cannot be interpreted with USDC's six decimals.
 // https://polygonscan.com/token/0x3c499c542cef5e3811e1192ce70d8cc03d5c3359
 const USDC = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359";
-type DuneActivityRow = { day: string; wallet: string; volume_usd: string | number };
+
+type Role = typeof MINTER_ROLE | typeof TRUSTED_OPERATOR_ROLE | typeof TRUSTED_FORWARDER_ROLE;
+type Position = { blockNumber: number; logIndex: number };
+type RoleMember = { role: Role; member: string };
+type RoleChange = RoleMember & Position & { isGrant: boolean };
+type RoleInterval = RoleMember & { from: Position; to?: Position };
+
+// Public Polygon RPCs cap historical eth_getLogs ranges. Replaying the registry
+// from its 2023 deployment for every seven-day activity batch would turn a small
+// adapter query into thousands of RPC calls. This event-derived checkpoint is the
+// active registry state at observationStart (2025-01-16T00:00:00Z). Changes up to
+// ROLE_SNAPSHOT_DAY are pinned below; changes on and after that day are read live.
+const ROLE_SNAPSHOT_DAY = "2026-08-24";
+const INITIAL_ROLE_MEMBERS: RoleMember[] = [
+  { role: MINTER_ROLE, member: "0x0725d2b69e107a7404c98c98aab7ec9dbf7af3c4" },
+  { role: MINTER_ROLE, member: "0x7fc1afb29861fd4a7dfb7859b5271d3c75e4abbd" },
+  { role: MINTER_ROLE, member: "0x0af477ac793c3ee69bfcad83e148add148705d79" },
+  { role: MINTER_ROLE, member: "0xa0e6cb4c42f0fe31846c48f2693bfe879bc10534" },
+  { role: MINTER_ROLE, member: "0x776023a4573bd972c4c3e2a76f611d3c2bef516e" },
+  { role: MINTER_ROLE, member: "0x243880832644839397725558b108dcf2af12a58d" },
+  { role: MINTER_ROLE, member: "0x4cd41debc6d038317379df1d059938894362ef7f" },
+  { role: MINTER_ROLE, member: "0x7ee9f40d48f4e58dc9f21fbd2335c4f2ec1f3d78" },
+  { role: MINTER_ROLE, member: "0x732134d7f99b90c704d736b360db45425073380f" },
+  { role: MINTER_ROLE, member: "0x92714d4827fa2e396d9f753976cc8a3d395b8064" },
+  { role: MINTER_ROLE, member: "0x5e9e7841198c34bad39c7344c6e2829ebf39b8b3" },
+  { role: MINTER_ROLE, member: "0x554ad79f0c9d512b624b9bfc2e1ffd4cf50cf220" },
+  { role: TRUSTED_OPERATOR_ROLE, member: "0x732134d7f99b90c704d736b360db45425073380f" },
+  { role: TRUSTED_OPERATOR_ROLE, member: "0xba98da3e643527acb88ffa50d5a7ca24a14565b4" },
+  { role: TRUSTED_OPERATOR_ROLE, member: "0x0725d2b69e107a7404c98c98aab7ec9dbf7af3c4" },
+  { role: TRUSTED_OPERATOR_ROLE, member: "0x1e0049783f008a0085193e00003d00cd54003c71" },
+  { role: TRUSTED_FORWARDER_ROLE, member: "0xd8253782c45a12053594b9deb72d8e8ab2fca54c" },
+  { role: TRUSTED_FORWARDER_ROLE, member: "0xc65d82ece367ef06bf2ab791b3f3cf037dc0e816" },
+];
+
+// RoleGranted/RoleRevoked events from observationStart through 2026-08-23 UTC.
+// blockNumber + logIndex preserve the exact within-block membership boundary.
+const PINNED_ROLE_CHANGES: RoleChange[] = [
+  { blockNumber: 66750075, logIndex: 106, isGrant: false, role: MINTER_ROLE, member: "0x92714d4827fa2e396d9f753976cc8a3d395b8064" },
+  { blockNumber: 66750149, logIndex: 179, isGrant: false, role: MINTER_ROLE, member: "0x7fc1afb29861fd4a7dfb7859b5271d3c75e4abbd" },
+  { blockNumber: 66750158, logIndex: 182, isGrant: false, role: MINTER_ROLE, member: "0x5e9e7841198c34bad39c7344c6e2829ebf39b8b3" },
+  { blockNumber: 66750164, logIndex: 249, isGrant: false, role: MINTER_ROLE, member: "0x4cd41debc6d038317379df1d059938894362ef7f" },
+  { blockNumber: 66750172, logIndex: 268, isGrant: false, role: MINTER_ROLE, member: "0x0af477ac793c3ee69bfcad83e148add148705d79" },
+  { blockNumber: 66750179, logIndex: 200, isGrant: false, role: MINTER_ROLE, member: "0x554ad79f0c9d512b624b9bfc2e1ffd4cf50cf220" },
+  { blockNumber: 66750187, logIndex: 192, isGrant: false, role: MINTER_ROLE, member: "0x7ee9f40d48f4e58dc9f21fbd2335c4f2ec1f3d78" },
+  { blockNumber: 66750194, logIndex: 277, isGrant: false, role: MINTER_ROLE, member: "0xa0e6cb4c42f0fe31846c48f2693bfe879bc10534" },
+  { blockNumber: 73163841, logIndex: 814, isGrant: true, role: TRUSTED_FORWARDER_ROLE, member: "0x07d79f0f6879f4d555431573320236628d16083e" },
+  { blockNumber: 76257739, logIndex: 900, isGrant: true, role: TRUSTED_OPERATOR_ROLE, member: "0x5e4943373c2198625bd441ae0629e9e7b4fb4797" },
+  { blockNumber: 77481133, logIndex: 670, isGrant: true, role: TRUSTED_OPERATOR_ROLE, member: "0x7fbf08a0ed3ef12565a61935ca6339bbecc25f48" },
+  { blockNumber: 81051878, logIndex: 1105, isGrant: true, role: MINTER_ROLE, member: "0x64ecc7f2753df33e21f7c4211ea2b68b608bf8f9" },
+  { blockNumber: 81652913, logIndex: 161, isGrant: true, role: TRUSTED_OPERATOR_ROLE, member: "0x64ecc7f2753df33e21f7c4211ea2b68b608bf8f9" },
+  { blockNumber: 86838127, logIndex: 1367, isGrant: true, role: TRUSTED_OPERATOR_ROLE, member: "0x969e8e93d83472223a0a87bfcca0c50ee6aed571" },
+  { blockNumber: 87467550, logIndex: 383, isGrant: true, role: MINTER_ROLE, member: "0x39cb23e079084cfd3e0e1bee896fbf9175fa10fb" },
+];
 
 async function queryActivity(
   context: RetentionQueryContext,
   range: RetentionActivityRange,
 ): Promise<RetentionActivity[]> {
-  // Dune EVM addresses are varbinary literals, so they must not be quoted.
-  const rows = await context.queryDuneSql<DuneActivityRow>(`
-WITH role_changes AS (
-  SELECT bytearray_substring(topic2, 13, 20) AS member,
-         topic1 AS role,
-         topic0 = ${ROLE_GRANTED} AS is_grant,
-         block_number,
-         index AS log_index,
-         lead(block_number) OVER (
-           PARTITION BY topic1, topic2 ORDER BY block_number, index
-         ) AS next_block_number,
-         lead(index) OVER (
-           PARTITION BY topic1, topic2 ORDER BY block_number, index
-         ) AS next_log_index
-  FROM polygon.logs
-  WHERE contract_address = ${REGISTRY}
-    AND block_date >= date '${REGISTRY_ROLE_START}'
-    AND block_date < date '${range.toDayExclusive}'
-    AND topic0 IN (${ROLE_GRANTED}, ${ROLE_REVOKED})
-    AND topic1 IN (${MINTER_ROLE}, ${TRUSTED_OPERATOR_ROLE}, ${TRUSTED_FORWARDER_ROLE})
-),
-active_role_intervals AS (
-  SELECT member, role, block_number, log_index, next_block_number, next_log_index
-  FROM role_changes
-  WHERE is_grant
-),
-mint_activity AS (
-  SELECT DISTINCT l.block_number,
-         l.index AS log_index,
-         cast(date_trunc('day', l.block_time) AS date) AS day,
-         lower(concat('0x', to_hex(bytearray_substring(l.topic1, 13, 20)))) AS wallet,
-         cast(varbinary_to_uint256(bytearray_substring(l.data, 97, 32)) AS double) / 1e6 AS volume_usd
-  FROM polygon.logs l
-  JOIN active_role_intervals role
-    ON role.member = l.contract_address
-   AND role.role = ${MINTER_ROLE}
-   AND (l.block_number > role.block_number OR
-        (l.block_number = role.block_number AND l.index >= role.log_index))
-   AND (role.next_block_number IS NULL OR l.block_number < role.next_block_number OR
-        (l.block_number = role.next_block_number AND l.index < role.next_log_index))
-  WHERE l.block_date >= date '${range.fromDay}' AND l.block_date < date '${range.toDayExclusive}'
-    AND l.topic0 = ${TOKEN_PURCHASED_AND_MINTED}
-    AND bytearray_substring(l.data, 77, 20) = ${USDC}
-),
-marketplace_activity AS (
-  SELECT DISTINCT l.block_number,
-         l.index AS log_index,
-         cast(date_trunc('day', l.block_time) AS date) AS day,
-         lower(concat('0x', to_hex(bytearray_substring(l.topic1, 13, 20)))) AS wallet,
-         cast(varbinary_to_uint256(bytearray_substring(l.data, 33, 32)) AS double) / 1e6 AS volume_usd
-  FROM polygon.logs l
-  JOIN active_role_intervals role
-    ON role.member = l.contract_address
-   AND role.role IN (${TRUSTED_OPERATOR_ROLE}, ${TRUSTED_FORWARDER_ROLE})
-   AND (l.block_number > role.block_number OR
-        (l.block_number = role.block_number AND l.index >= role.log_index))
-   AND (role.next_block_number IS NULL OR l.block_number < role.next_block_number OR
-        (l.block_number = role.next_block_number AND l.index < role.next_log_index))
-  WHERE l.block_date >= date '${range.fromDay}' AND l.block_date < date '${range.toDayExclusive}'
-    AND l.topic0 = ${TRADE_EXECUTED}
-    AND bytearray_substring(l.data, 13, 20) = ${USDC}
-)
-SELECT day, wallet, sum(volume_usd) AS volume_usd
-FROM (
-  SELECT day, wallet, volume_usd FROM mint_activity
-  UNION ALL
-  SELECT day, wallet, volume_usd FROM marketplace_activity
-)
-GROUP BY 1, 2
-  `);
-  return rows.map((row) => ({ day: String(row.day).slice(0, 10), wallet: row.wallet, volumeUsd: Number(row.volume_usd) }));
+  const liveRoleChanges = range.toDayExclusive > ROLE_SNAPSHOT_DAY
+    ? parseRoleChanges(await context.queryEvmLogs({
+      targets: [REGISTRY],
+      topic0: [ROLE_GRANTED, ROLE_REVOKED],
+      fromDay: ROLE_SNAPSHOT_DAY,
+      toDayExclusive: range.toDayExclusive,
+    }))
+    : [];
+  const intervals = buildRoleIntervals([
+    ...PINNED_ROLE_CHANGES,
+    ...liveRoleChanges,
+  ]);
+  const minters = membersForRoles(intervals, [MINTER_ROLE]);
+  const marketplaces = membersForRoles(intervals, [
+    TRUSTED_OPERATOR_ROLE,
+    TRUSTED_FORWARDER_ROLE,
+  ]);
+  const activity: RetentionActivity[] = [];
+
+  // Query one UTC day at a time. This keeps both result size and provider block
+  // ranges bounded even when the state service executes a week-long batch.
+  for (let day = range.fromDay; day < range.toDayExclusive; day = addUtcDay(day)) {
+    const toDayExclusive = addUtcDay(day);
+    const mintLogs = await context.queryEvmLogs({
+      targets: minters,
+      topic0: TOKEN_PURCHASED_AND_MINTED,
+      fromDay: day,
+      toDayExclusive,
+    });
+    const tradeLogs = await context.queryEvmLogs({
+      targets: marketplaces,
+      topic0: TRADE_EXECUTED,
+      fromDay: day,
+      toDayExclusive,
+    });
+
+    for (const log of mintLogs) {
+      if (!hasActiveRole(log, MINTER_ROLE, intervals) || dataAddress(log.data, 2) !== USDC) continue;
+      activity.push({ day, wallet: topicAddress(log.topics[1]), volumeUsd: usdcAmount(log.data, 3) });
+    }
+    for (const log of tradeLogs) {
+      const isMarketplace = hasActiveRole(log, TRUSTED_OPERATOR_ROLE, intervals)
+        || hasActiveRole(log, TRUSTED_FORWARDER_ROLE, intervals);
+      if (!isMarketplace || dataAddress(log.data, 0) !== USDC) continue;
+      activity.push({ day, wallet: topicAddress(log.topics[1]), volumeUsd: usdcAmount(log.data, 1) });
+    }
+  }
+
+  return activity;
+}
+
+function parseRoleChanges(logs: RetentionEvmLog[]): RoleChange[] {
+  const relevantRoles = new Set<string>([
+    MINTER_ROLE,
+    TRUSTED_OPERATOR_ROLE,
+    TRUSTED_FORWARDER_ROLE,
+  ]);
+  return logs.flatMap((log) => {
+    const event = log.topics[0]?.toLowerCase();
+    const role = log.topics[1]?.toLowerCase();
+    if ((event !== ROLE_GRANTED && event !== ROLE_REVOKED) || !relevantRoles.has(role)) return [];
+    return [{
+      blockNumber: log.blockNumber,
+      logIndex: log.logIndex,
+      isGrant: event === ROLE_GRANTED,
+      role: role as Role,
+      member: topicAddress(log.topics[2]),
+    }];
+  });
+}
+
+function buildRoleIntervals(changes: RoleChange[]): RoleInterval[] {
+  const intervals: RoleInterval[] = INITIAL_ROLE_MEMBERS.map(({ role, member }) => ({
+    role,
+    member,
+    from: { blockNumber: 0, logIndex: 0 },
+  }));
+  const open = new Map(intervals.map((interval) => [roleKey(interval.role, interval.member), interval]));
+  const sorted = [...changes].sort(compareChanges);
+
+  for (const change of sorted) {
+    const key = roleKey(change.role, change.member);
+    const current = open.get(key);
+    if (change.isGrant) {
+      if (current) continue;
+      const interval: RoleInterval = {
+        role: change.role,
+        member: change.member,
+        from: change,
+      };
+      intervals.push(interval);
+      open.set(key, interval);
+    } else if (current) {
+      current.to = change;
+      open.delete(key);
+    }
+  }
+  return intervals;
+}
+
+function membersForRoles(intervals: RoleInterval[], roles: Role[]): string[] {
+  const accepted = new Set<Role>(roles);
+  return [...new Set(intervals.filter(({ role }) => accepted.has(role)).map(({ member }) => member))];
+}
+
+function hasActiveRole(log: RetentionEvmLog, role: Role, intervals: RoleInterval[]): boolean {
+  const address = log.address.toLowerCase();
+  const position = { blockNumber: log.blockNumber, logIndex: log.logIndex };
+  return intervals.some((interval) => interval.role === role
+    && interval.member === address
+    && comparePositions(position, interval.from) >= 0
+    && (!interval.to || comparePositions(position, interval.to) < 0));
+}
+
+function roleKey(role: Role, member: string): string {
+  return `${role}:${member}`;
+}
+
+function compareChanges(a: RoleChange, b: RoleChange): number {
+  return comparePositions(a, b);
+}
+
+function comparePositions(a: Position, b: Position): number {
+  return a.blockNumber - b.blockNumber || a.logIndex - b.logIndex;
+}
+
+function topicAddress(topic: string | undefined): string {
+  if (!topic || !/^0x[0-9a-fA-F]{64}$/.test(topic)) throw new Error(`invalid address topic: ${topic}`);
+  return `0x${topic.slice(-40).toLowerCase()}`;
+}
+
+function dataAddress(data: string, wordIndex: number): string {
+  return `0x${dataWord(data, wordIndex).slice(-40).toLowerCase()}`;
+}
+
+function usdcAmount(data: string, wordIndex: number): number {
+  const raw = BigInt(`0x${dataWord(data, wordIndex)}`);
+  const whole = raw / 1_000_000n;
+  if (whole > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error(`USDC amount exceeds safe range: ${raw}`);
+  return Number(whole) + Number(raw % 1_000_000n) / 1e6;
+}
+
+function dataWord(data: string, wordIndex: number): string {
+  if (!/^0x[0-9a-fA-F]*$/.test(data)) throw new Error("invalid event data");
+  const start = 2 + wordIndex * 64;
+  const word = data.slice(start, start + 64);
+  if (word.length !== 64) throw new Error(`event data is missing word ${wordIndex}`);
+  return word;
+}
+
+function addUtcDay(day: string): string {
+  return new Date(Date.parse(`${day}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10);
 }
 
 export const retentionManifest = defineRetentionManifest({
@@ -130,8 +256,6 @@ export const retentionManifest = defineRetentionManifest({
   // lookback and reduces the chance of treating an existing buyer as first-seen.
   observationStart: "2025-01-16",
   firstCohortStart: "2025-10-01",
-  // One complete week per query keeps the backfill bounded; Dune pagination handles
-  // weeks whose result has more than 100k wallet-day rows.
   maxQueryDays: 7,
   queryActivity,
   methodology:

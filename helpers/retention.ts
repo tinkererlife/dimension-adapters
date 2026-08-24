@@ -14,7 +14,22 @@ export interface RetentionActivityRange {
   toDayExclusive: string;
 }
 
+export interface RetentionEvmLog {
+  address: string;
+  blockNumber: number;
+  logIndex: number;
+  transactionHash: string;
+  topics: string[];
+  data: string;
+}
+
+export interface RetentionEvmLogQuery extends RetentionActivityRange {
+  targets: string[];
+  topic0: string | string[];
+}
+
 export interface RetentionQueryContext {
+  queryEvmLogs: (query: RetentionEvmLogQuery) => Promise<RetentionEvmLog[]>;
   queryDuneSql: <T>(sql: string) => Promise<T[]>;
 }
 
