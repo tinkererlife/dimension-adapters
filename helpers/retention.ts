@@ -1,4 +1,3 @@
-import type { ChainApi } from "@defillama/sdk";
 import type { FetchOptions, FetchResultRetention, SimpleAdapter } from "../adapters/types";
 
 const DAY = 86400;
@@ -16,7 +15,6 @@ export interface RetentionActivityRange {
 }
 
 export interface RetentionQueryContext {
-  api: Pick<ChainApi, "call">;
   queryDuneSql: <T>(sql: string) => Promise<T[]>;
 }
 
