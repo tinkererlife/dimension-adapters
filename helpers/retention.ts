@@ -3,35 +3,81 @@ import type { FetchOptions, FetchResultRetention, SimpleAdapter } from "../adapt
 const DAY = 86400;
 const FIRST_HORIZON_WEEKS = 4;
 
-export interface RetentionActivity {
-  day: string;
-  wallet: string;
-  volumeUsd: number;
+export interface RetentionDuneSqlSource {
+  id: string;
+  type: "duneSql";
+  /** Raw read-only SQL. The backend replaces the two required day tokens. */
+  sql: string;
+  output: {
+    day: string;
+    wallet: string;
+    volumeUsd: string;
+  };
 }
 
-export interface RetentionActivityRange {
-  fromDay: string;
-  toDayExclusive: string;
+export interface RetentionEvmStaticTargets {
+  type: "static";
+  addresses: string[];
 }
 
-export interface RetentionEvmLog {
-  address: string;
+export interface RetentionAccessControlRoleMember {
+  role: string;
+  member: string;
+}
+
+export interface RetentionAccessControlRoleChange
+  extends RetentionAccessControlRoleMember {
   blockNumber: number;
   logIndex: number;
-  transactionHash: string;
-  topics: string[];
-  data: string;
+  isGrant: boolean;
 }
 
-export interface RetentionEvmLogQuery extends RetentionActivityRange {
-  targets: string[];
-  topic0: string | string[];
+export interface RetentionAccessControlHistory {
+  /** Day whose start corresponds to activeAtStart. */
+  startDay: string;
+  /** First day whose registry events must be queried live by the backend. */
+  liveFromDay: string;
+  activeAtStart: RetentionAccessControlRoleMember[];
+  changesBeforeLive: RetentionAccessControlRoleChange[];
 }
 
-export interface RetentionQueryContext {
-  queryEvmLogs: (query: RetentionEvmLogQuery) => Promise<RetentionEvmLog[]>;
-  queryDuneSql: <T>(sql: string) => Promise<T[]>;
+export interface RetentionEvmAccessControlTargets {
+  type: "accessControlRegistry";
+  address: string;
+  roles: string[];
+  grantedTopic0: string;
+  revokedTopic0: string;
+  history: RetentionAccessControlHistory;
 }
+
+export type RetentionEvmTargets =
+  | RetentionEvmStaticTargets
+  | RetentionEvmAccessControlTargets;
+
+export interface RetentionEvmEventField {
+  type: "address" | "bytes32" | "uint256";
+  topic?: number;
+  dataWord?: number;
+}
+
+export interface RetentionEvmEventSource {
+  id: string;
+  type: "evmEvents";
+  targets: RetentionEvmTargets;
+  event: {
+    /** Human-readable ABI for reviewers; topic0 is the RPC filter. */
+    abi: string;
+    topic0: string;
+    fields: Record<string, RetentionEvmEventField>;
+  };
+  where?: Array<{ field: string; equals: string }>;
+  output: {
+    wallet: string;
+    volumeUsd: { field: string; decimals: number };
+  };
+}
+
+export type RetentionSource = RetentionDuneSqlSource | RetentionEvmEventSource;
 
 export interface RetentionManifest {
   project: string;
@@ -41,10 +87,7 @@ export interface RetentionManifest {
   firstCohortStart: string;
   maxQueryDays?: number;
   methodology: string;
-  queryActivity: (
-    context: RetentionQueryContext,
-    range: RetentionActivityRange,
-  ) => Promise<RetentionActivity[]>;
+  sources: RetentionSource[];
 }
 
 export function defineRetentionManifest(
@@ -63,6 +106,16 @@ export function defineRetentionManifest(
     (!Number.isInteger(manifest.maxQueryDays) || manifest.maxQueryDays < 1)
   ) {
     throw new Error(`${manifest.project}: maxQueryDays must be a positive integer`);
+  }
+  if (!Array.isArray(manifest.sources) || manifest.sources.length === 0) {
+    throw new Error(`${manifest.project}: sources must be a non-empty array`);
+  }
+  const sourceIds = new Set<string>();
+  for (const source of manifest.sources) {
+    if (!source.id || sourceIds.has(source.id)) {
+      throw new Error(`${manifest.project}: source ids must be non-empty and unique`);
+    }
+    sourceIds.add(source.id);
   }
   return manifest;
 }
